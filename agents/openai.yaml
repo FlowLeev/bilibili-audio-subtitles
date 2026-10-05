@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bilibili 音频转字幕"
+  short_description: "用 yutto 下载 B 站音频，再用 Whisper 生成带时间戳的字幕"
+  default_prompt: "使用 $bilibili-audio-subtitles 下载这个 Bilibili 视频的音频，并把字幕保存到当前项目。"
