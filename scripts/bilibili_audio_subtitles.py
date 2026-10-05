@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 MODEL_ID = "openai/whisper-large-v3-turbo"
+SCRIPT_VERSION = "2.0.0"
+QUALITY_LIMITS = {
+    "max_cue_seconds": 12.0,
+    "max_characters_per_second": 25.0,
+    "min_characters_per_second": 0.5,
+    "sparse_cue_min_seconds": 8.0,
+    "max_cue_characters": 120,
+    "identical_cue_run": 3,
+    "repeated_phrase_count": 5,
+}
 
 
 def log(message):
@@ -86,6 +99,7 @@ def decode_audio(audio, limit=None):
 
 def transcribe(samples, args):
     import torch
+    import transformers
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
     torch.set_num_threads(args.threads)
     device = args.device
@@ -99,20 +113,38 @@ def transcribe(samples, args):
         MODEL_ID, torch_dtype=dtype, low_cpu_mem_usage=True, use_safetensors=True,
     ).to(device)
     processor = AutoProcessor.from_pretrained(MODEL_ID)
-    asr = pipeline(
-        "automatic-speech-recognition", model=model, tokenizer=processor.tokenizer,
+    pipeline_options = dict(
+        model=model, tokenizer=processor.tokenizer,
         feature_extractor=processor.feature_extractor, device=device,
-        torch_dtype=dtype, chunk_length_s=30, batch_size=args.batch_size,
+        torch_dtype=dtype, batch_size=args.batch_size,
     )
+    if args.chunk_length_seconds is not None:
+        pipeline_options["chunk_length_s"] = args.chunk_length_seconds
+        log("注意：显式启用了实验性外部分块；默认应使用原生长音频模式。")
+    asr = pipeline("automatic-speech-recognition", **pipeline_options)
     generation = {"task": "transcribe", "condition_on_prev_tokens": False}
     if args.language:
         generation["language"] = args.language
-    log(f"开始转写 {len(samples) / 16000:.2f} 秒音频，return_timestamps=True。")
+    mode = "external-chunking" if args.chunk_length_seconds is not None else "native-long-form"
+    configuration = {
+        "device": device, "dtype": str(dtype), "transcription_mode": mode,
+        "generation_parameters": {**generation, "return_timestamps": True},
+        "model_generation_config": asr.generation_config.to_dict(),
+        "model_revision": getattr(model.config, "_commit_hash", None),
+        "pipeline_parameters": {"chunk_length_s": args.chunk_length_seconds, "batch_size": args.batch_size},
+        "versions": {"python": sys.version.split()[0], "torch": torch.__version__, "transformers": transformers.__version__},
+    }
+    log(f"开始转写 {len(samples) / 16000:.2f} 秒音频，模式 {mode}，return_timestamps=True。")
+    started = time.perf_counter()
     with torch.inference_mode():
-        return asr(
+        result = asr(
             {"raw": samples, "sampling_rate": 16000},
             return_timestamps=True, generate_kwargs=generation,
-        ), device
+        )
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    configuration["inference_seconds"] = time.perf_counter() - started
+    return result, configuration
 
 
 def normalize_chunks(chunks, duration):
@@ -145,7 +177,7 @@ def normalize_chunks(chunks, duration):
         if (fixed_start, fixed_end) != (start, end):
             notes.append(f"chunk {index}: clamped timestamps to ordered audio bounds")
         if end_ms <= start_ms:
-            raise ValueError(f"第 {index + 1} 段没有有效时长；原始结果保留在 JSON，请检查。")
+            raise ValueError(f"第 {index + 1} 段没有有效时长；请检查诊断中的原始结果。")
         cues.append({"start": start_ms / 1000, "end": end_ms / 1000, "text": text})
         previous_end = end_ms / 1000
     if not cues:
@@ -161,21 +193,102 @@ def timecode(seconds, separator):
     return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}{separator}{milliseconds:03d}"
 
 
-def save_subtitles(paths, result, metadata, duration):
-    # Preserve raw output even if validation rejects subtitle creation.
-    payload = {**metadata, "text": result.get("text", ""), "chunks": result.get("chunks", [])}
-    paths["json"].write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    cues, notes = normalize_chunks(result.get("chunks", []), duration)
-    payload.update({"segments": cues, "timestamp_repairs": notes})
-    paths["json"].write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    srt, vtt = [], ["WEBVTT\n"]
+def compact_text(text):
+    return "".join(character.casefold() for character in text if character.isalnum())
+
+
+def check_quality(cues, max_cue_seconds=12.0):
+    """Heuristic alerts, never a claim that the transcript matches the audio."""
+    limits = {**QUALITY_LIMITS, "max_cue_seconds": max_cue_seconds}
+    warnings = []
+
+    def warn(code, first, last, detail):
+        warnings.append({"code": code, "cue_numbers": [first + 1, last + 1],
+                         "start": cues[first]["start"], "end": cues[last]["end"], "detail": detail})
+
+    texts = [compact_text(cue["text"]) for cue in cues]
+    for index, (cue, text) in enumerate(zip(cues, texts)):
+        duration = cue["end"] - cue["start"]
+        if duration > limits["max_cue_seconds"]:
+            warn("long_cue", index, index, f"字幕持续 {duration:.2f} 秒，超过 {limits['max_cue_seconds']:g} 秒。")
+        if len(text) > limits["max_cue_characters"]:
+            warn("long_text", index, index, f"单条字幕含 {len(text)} 个文字字符。")
+        rate = len(text) / duration
+        if rate > limits["max_characters_per_second"]:
+            warn("dense_text", index, index, f"文字密度 {rate:.2f} 字符/秒，需核对对齐情况。")
+        if duration >= limits["sparse_cue_min_seconds"] and rate < limits["min_characters_per_second"]:
+            warn("sparse_text", index, index, f"文字密度仅 {rate:.2f} 字符/秒，需核对遗漏或错误时长。")
+        # Includes repeated Chinese characters and multiword phrases, ignoring punctuation.
+        repeated = re.search(r"(.{1,20}?)\1{4,}", text)
+        if repeated:
+            warn("repeated_phrase", index, index, f"词句“{repeated.group(1)}”连续重复至少 5 次，需对照音频。")
+
+    first = 0
+    while first < len(cues):
+        last = first + 1
+        while last < len(cues) and texts[first] and texts[last] == texts[first]:
+            last += 1
+        if last - first >= limits["identical_cue_run"]:
+            warn("identical_cues", first, last - 1, f"连续 {last - first} 条字幕内容相同，需对照音频。")
+        first = last
+    return {"status": "needs_review" if warnings else "no_obvious_anomaly", "human_verified": False,
+            "limits": limits, "warnings": warnings,
+            "max_cue_seconds": max((cue["end"] - cue["start"] for cue in cues), default=0)}
+
+
+def write_diagnostics(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def save_subtitles(srt_path, diagnostics_path, result, metadata, duration, max_cue_seconds=12.0):
+    payload = {**metadata, "script_version": SCRIPT_VERSION, "output_path": str(srt_path),
+               "text": result.get("text", ""), "chunks": result.get("chunks", []),
+               "structure_check": {"status": "pending"},
+               "quality_check": {"status": "not_run", "human_verified": False}}
+    # Save raw results before validation; a failed check must not discard model output.
+    write_diagnostics(diagnostics_path, payload)
+    try:
+        cues, notes = normalize_chunks(result.get("chunks", []), duration)
+    except ValueError as error:
+        payload["structure_check"] = {"status": "failed", "error": str(error)}
+        write_diagnostics(diagnostics_path, payload)
+        log(f"结构检查失败；原始结果保留在：{diagnostics_path}")
+        raise
+    quality = check_quality(cues, max_cue_seconds)
+    if notes:
+        quality["status"] = "needs_review"
+        quality["warnings"].append({"code": "timestamp_repairs", "detail": notes})
+    payload.update({"segments": cues, "timestamp_repairs": notes,
+                    "structure_check": {"status": "passed", "cue_count": len(cues)},
+                    "quality_check": quality,
+                    "recommendation": "review_required" if quality["warnings"] else "machine_draft"})
+    write_diagnostics(diagnostics_path, payload)
+    srt = []
     for number, cue in enumerate(cues, 1):
         srt.append(f"{number}\n{timecode(cue['start'], ',')} --> {timecode(cue['end'], ',')}\n{cue['text']}\n")
-        vtt.append(f"{timecode(cue['start'], '.')} --> {timecode(cue['end'], '.')}\n{cue['text']}\n")
-    paths["srt"].write_text("\n".join(srt) + "\n", encoding="utf-8")
-    paths["vtt"].write_text("\n".join(vtt) + "\n", encoding="utf-8")
-    paths["txt"].write_text(result.get("text", "").strip() + "\n", encoding="utf-8")
-    log(f"已生成 {len(cues)} 段字幕，时间戳修正 {len(notes)} 项（详见 JSON）。")
+    srt_path.parent.mkdir(parents=True, exist_ok=True)
+    with srt_path.open("x", encoding="utf-8") as output:
+        output.write("\n".join(srt) + "\n")
+    log(f"结构检查通过：{len(cues)} 段，最长 {quality['max_cue_seconds']:.2f} 秒。")
+    if quality["warnings"]:
+        log(f"需要复核：发现 {len(quality['warnings'])} 项质量告警；退出码为 2，字幕已保留。")
+        for warning in quality["warnings"][:10]:
+            log(f"  {warning['code']}: {warning['detail']}")
+        if len(quality["warnings"]) > 10:
+            log("  其余告警请查看诊断记录。")
+    else:
+        log("质量检查未发现明显异常；这是机器转写草稿，术语和逐句内容未经人工校对。")
+    log(f"字幕：{srt_path}")
+    log(f"原始结果及诊断：{diagnostics_path}")
+    return payload
+
+
+def choose_output(project, stem, mode, run_id):
+    output = project / f"{stem}.srt"
+    if output.exists():
+        output = project / f"{stem}-{mode}-v{SCRIPT_VERSION}-{run_id}.srt"
+    return output
 
 
 def positive_int(value):
@@ -193,6 +306,7 @@ def positive_float(value):
 
 
 def main(argv=None):
+    started = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", nargs="?", help="标准 Bilibili 视频链接或 BV/av 号")
     parser.add_argument("--audio", type=Path, help="继续转写本地音频，不传 URL")
@@ -203,9 +317,11 @@ def main(argv=None):
     parser.add_argument("--device", default="auto", help="auto、cpu 或 cuda:N")
     parser.add_argument("--threads", type=positive_int, default=8)
     parser.add_argument("--batch-size", type=positive_int, default=1)
+    parser.add_argument("--chunk-length-seconds", type=positive_float, help="显式启用实验性外部分块；默认使用 Whisper 原生长音频")
+    parser.add_argument("--max-cue-seconds", type=positive_float, default=QUALITY_LIMITS["max_cue_seconds"])
+    parser.add_argument("--diagnostics-dir", type=Path, default=Path.home() / ".cache" / "bilibili-audio-subtitles" / "runs")
     parser.add_argument("--limit-seconds", type=positive_float, help="仅转写开头片段，输出标记 sample")
     parser.add_argument("--download-only", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--auth-file", type=Path)
     args = parser.parse_args(argv)
     if bool(args.url) == bool(args.audio):
@@ -226,11 +342,10 @@ def main(argv=None):
     if args.limit_seconds is not None:
         stem += f"-sample-{args.limit_seconds:g}s"
     project = args.project_dir.expanduser().resolve()
-    paths = {suffix: project / f"{stem}.{suffix}" for suffix in ("srt", "vtt", "txt", "json")}
-    if not args.download_only and not args.overwrite:
-        existing = [str(path) for path in paths.values() if path.exists()]
-        if existing:
-            raise FileExistsError("拒绝覆盖已有结果；使用新名字或 --overwrite：" + ", ".join(existing))
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    mode = "chunked" if args.chunk_length_seconds is not None else "native"
+    srt_path = choose_output(project, stem, mode, run_id)
+    diagnostics_path = args.diagnostics_dir.expanduser().resolve() / f"{stem}-{run_id}.json"
     audio = args.audio.expanduser().resolve(strict=True) if args.audio else download_audio(
         url, download_stem, args.download_dir.expanduser().resolve(), args.auth_file,
     )
@@ -240,18 +355,19 @@ def main(argv=None):
         return 0
     samples = decode_audio(audio, args.limit_seconds)
     transcribed_duration = len(samples) / 16000
-    result, device = transcribe(samples, args)
-    project.mkdir(parents=True, exist_ok=True)
-    save_subtitles(paths, result, {
+    expected_duration = min(duration, args.limit_seconds) if args.limit_seconds is not None else duration
+    if abs(transcribed_duration - expected_duration) > 0.25:
+        raise RuntimeError("解码时长与预期音频时长不匹配，停止转写。")
+    result, configuration = transcribe(samples, args)
+    payload = save_subtitles(srt_path, diagnostics_path, result, {
+        **configuration, "run_id": run_id, "elapsed_seconds": time.perf_counter() - started,
         "model": MODEL_ID, "return_timestamps": True, "task": "transcribe",
         "source_url": url, "audio_path": str(audio), "language": args.language or "auto",
-        "device": device, "audio_duration_seconds": duration,
+        "audio_duration_seconds": duration,
         "transcribed_duration_seconds": transcribed_duration,
         "partial": args.limit_seconds is not None and transcribed_duration < duration - 0.01,
-    }, transcribed_duration)
-    for path in paths.values():
-        log(f"输出：{path}")
-    return 0
+    }, transcribed_duration, args.max_cue_seconds)
+    return 2 if payload["quality_check"]["status"] == "needs_review" else 0
 
 
 if __name__ == "__main__":
