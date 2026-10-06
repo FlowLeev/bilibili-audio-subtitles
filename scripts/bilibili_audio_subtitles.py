@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download Bilibili/YouTube audio and generate a single Whisper SRT draft."""
+"""Download Bilibili/YouTube audio and generate a single timestamped SRT draft."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 MODEL_ID = "openai/whisper-large-v3-turbo"
-SCRIPT_VERSION = "2.1.0"
+SCRIPT_VERSION = "3.0.0"
 QUALITY_LIMITS = {
     "max_cue_seconds": 12.0,
     "max_characters_per_second": 25.0,
@@ -212,6 +212,9 @@ def decode_audio(audio, limit=None):
 
 
 def transcribe(samples, args):
+    if args.engine == "qwen":
+        from qwen_subtitles import transcribe_qwen
+        return transcribe_qwen(samples, args)
     import torch
     import transformers
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
@@ -241,6 +244,7 @@ def transcribe(samples, args):
         generation["language"] = args.language
     mode = "external-chunking" if args.chunk_length_seconds is not None else "native-long-form"
     configuration = {
+        "engine": "whisper", "model": MODEL_ID,
         "device": device, "dtype": str(dtype), "transcription_mode": mode,
         "generation_parameters": {**generation, "return_timestamps": True},
         "model_generation_config": asr.generation_config.to_dict(),
@@ -356,13 +360,15 @@ def write_diagnostics(path, payload):
 
 
 def save_subtitles(srt_path, diagnostics_path, result, metadata, duration, max_cue_seconds=12.0):
-    payload = {**metadata, "script_version": SCRIPT_VERSION, "output_path": str(srt_path),
+    payload = {**metadata, **result, "script_version": SCRIPT_VERSION, "output_path": str(srt_path),
                "text": result.get("text", ""), "chunks": result.get("chunks", []),
                "structure_check": {"status": "pending"},
                "quality_check": {"status": "not_run", "human_verified": False}}
     # Save raw results before validation; a failed check must not discard model output.
     write_diagnostics(diagnostics_path, payload)
     try:
+        if result.get("alignment_error"):
+            raise ValueError(result["alignment_error"])
         cues, notes = normalize_chunks(result.get("chunks", []), duration)
     except ValueError as error:
         payload["structure_check"] = {"status": "failed", "error": str(error)}
@@ -370,6 +376,9 @@ def save_subtitles(srt_path, diagnostics_path, result, metadata, duration, max_c
         log(f"结构检查失败；原始结果保留在：{diagnostics_path}")
         raise
     quality = check_quality(cues, max_cue_seconds)
+    if result.get("model_quality_warnings"):
+        quality["status"] = "needs_review"
+        quality["warnings"].extend(result["model_quality_warnings"])
     if notes:
         quality["status"] = "needs_review"
         quality["warnings"].append({"code": "timestamp_repairs", "detail": notes})
@@ -428,6 +437,7 @@ def main(argv=None):
     parser.add_argument("--download-dir", type=Path, default=Path.home() / "Downloads")
     parser.add_argument("--output-name")
     parser.add_argument("--language", help="默认自动识别；可传 chinese / english 等")
+    parser.add_argument("--engine", choices=["qwen", "whisper"], default="qwen", help="默认 Qwen ASR + ForcedAligner；可选择原生 Whisper")
     parser.add_argument("--device", default="auto", help="auto、cpu 或 cuda:N")
     parser.add_argument("--threads", type=positive_int, default=8)
     parser.add_argument("--batch-size", type=positive_int, default=1)
@@ -443,6 +453,8 @@ def main(argv=None):
         parser.error("必须提供 URL 或 --audio，二选一。")
     if args.download_only and args.audio:
         parser.error("--download-only 需要 URL。")
+    if args.engine == "qwen" and args.chunk_length_seconds is not None:
+        parser.error("--chunk-length-seconds 仅用于 --engine whisper；Qwen 使用官方 SDK 的长音频处理。")
     if not re.fullmatch(r"auto|cpu|cuda(?::\d+)?", args.device):
         parser.error("--device 只支持 auto、cpu、cuda 或 cuda:N。")
     for tool in ("ffmpeg", "ffprobe"):
@@ -464,7 +476,7 @@ def main(argv=None):
         stem += f"-sample-{args.limit_seconds:g}s"
     project = args.project_dir.expanduser().resolve()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    mode = "chunked" if args.chunk_length_seconds is not None else "native"
+    mode = "qwen" if args.engine == "qwen" else ("chunked" if args.chunk_length_seconds is not None else "native")
     srt_path = choose_output(project, stem, mode, run_id)
     diagnostics_path = args.diagnostics_dir.expanduser().resolve() / f"{stem}-{run_id}.json"
     download_events = []
@@ -489,10 +501,20 @@ def main(argv=None):
     expected_duration = min(duration, args.limit_seconds) if args.limit_seconds is not None else duration
     if abs(transcribed_duration - expected_duration) > 0.25:
         raise RuntimeError("解码时长与预期音频时长不匹配，停止转写。")
-    result, configuration = transcribe(samples, args)
+    try:
+        result, configuration = transcribe(samples, args)
+    except (RuntimeError, ValueError, OSError) as error:
+        write_diagnostics(diagnostics_path, {
+            "script_version": SCRIPT_VERSION, "run_id": run_id, "engine": args.engine,
+            "stage": "transcription", "error": str(error), "audio_path": str(audio),
+            "source_url": url, "transcribed_duration_seconds": transcribed_duration,
+            "language": args.language or "auto", "download_events": download_events,
+        })
+        log(f"转写失败诊断：{diagnostics_path}")
+        raise
     payload = save_subtitles(srt_path, diagnostics_path, result, {
         **configuration, "run_id": run_id, "elapsed_seconds": time.perf_counter() - started,
-        "model": MODEL_ID, "return_timestamps": True, "task": "transcribe",
+        "return_timestamps": True, "task": "transcribe",
         "source_platform": platform, "download_events": download_events,
         "source_url": url, "audio_path": str(audio), "language": args.language or "auto",
         "audio_duration_seconds": duration,

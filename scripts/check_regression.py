@@ -28,8 +28,8 @@ def summarize(path):
 
 
 def check_candidate(data, report):
-    if data.get("transcription_mode") != "native-long-form" or data.get("partial") is not False:
-        raise ValueError("回归候选必须是完整音频的原生长音频转写。")
+    if data.get("transcription_mode") not in {"native-long-form", "qwen-asr-forced-alignment"} or data.get("partial") is not False:
+        raise ValueError("回归候选必须是完整音频的 Whisper 原生或 Qwen 官方对齐转写。")
     if data.get("structure_check", {}).get("status") != "passed":
         raise ValueError("候选结果的结构检查未通过。")
     if data.get("quality_check", {}).get("status") != "no_obvious_anomaly":
