@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Download one Bilibili video part with yutto and generate Whisper subtitles."""
+"""Download Bilibili/YouTube audio and generate a single Whisper SRT draft."""
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 import json
 import math
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 MODEL_ID = "openai/whisper-large-v3-turbo"
-SCRIPT_VERSION = "2.0.0"
+SCRIPT_VERSION = "2.1.0"
 QUALITY_LIMITS = {
     "max_cue_seconds": 12.0,
     "max_characters_per_second": 25.0,
@@ -50,6 +51,100 @@ def video_identity(value):
     return f"https://www.bilibili.com/video/{video_id}/?p={part}", f"{video_id}-p{part}"
 
 
+def source_identity(value):
+    parsed = urlsplit(value)
+    if parsed.hostname not in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"}:
+        url, stem = video_identity(value)
+        return "bilibili", url, stem
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("YouTube 链接必须使用 HTTP 或 HTTPS。")
+    if parsed.hostname in {"youtu.be", "www.youtu.be"}:
+        video_id = parsed.path.strip("/")
+    elif parsed.path.rstrip("/") == "/watch":
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+    else:
+        match = re.fullmatch(r"/(?:shorts|live|embed)/([\w-]+)/?", parsed.path)
+        video_id = match.group(1) if match else ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise ValueError("请提供单个 YouTube 视频链接（watch、youtu.be、shorts 或 live），不支持仅有播放列表的链接。")
+    return "youtube", f"https://www.youtube.com/watch?v={video_id}", f"youtube-{video_id}"
+
+
+def package_version(package):
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return None
+
+
+def update_downloader(package):
+    """Check only the failed downloader's compatible stable releases, then upgrade once."""
+    from packaging.version import Version
+    current = package_version(package)
+    event = {"package": package, "installed_version": current}
+    log(f"下载失败，优先检查 {package} 更新（当前 {current or '未安装'}）。")
+    try:
+        query = subprocess.run(
+            [sys.executable, "-m", "pip", "index", "versions", package, "--json",
+             "--disable-pip-version-check", "--no-input", "--timeout", "10", "--retries", "1"],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+        latest = json.loads(query.stdout)["latest"]
+        event["latest_version"] = latest
+        if current and Version(latest) <= Version(current):
+            event["status"] = "up_to_date"
+            log(f"{package} 当前 {current}，最新兼容稳定版 {latest}；没有更新可用，停止自动重试并检查网络、登录或运行依赖。")
+            return event
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError) as error:
+        event["status"] = "check_failed"
+        # Do not expose captured pip output, which can contain authenticated index URLs.
+        event["error_type"] = type(error).__name__
+        log(f"无法确认 {package} 更新；保留原始下载错误，不自动修改其他包。")
+        return event
+    specification = f"yt-dlp[default]=={latest}" if package == "yt-dlp" else f"{package}=={latest}"
+    log(f"发现 {package} 新版 {latest}，在当前 Python 环境升级后仅重试一次。")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", specification,
+             "--disable-pip-version-check", "--no-input", "--timeout", "15", "--retries", "1"],
+            check=True, timeout=180,
+        )
+        event["updated_version"] = package_version(package)
+        event["status"] = "updated"
+    except (subprocess.SubprocessError, OSError) as error:
+        event["status"] = "upgrade_failed"
+        event["error_type"] = type(error).__name__
+        log(f"{package} 升级失败；停止重试并保留原始下载错误。")
+    return event
+
+
+def run_download(command, package, audio, events):
+    for attempt in (1, 2):
+        event = {"downloader": package, "version": package_version(package), "attempt": attempt}
+        events.append(event)
+        try:
+            subprocess.run(command, check=True, timeout=600)
+            if not audio.is_file() or not audio.stat().st_size:
+                raise RuntimeError("下载器没有生成预期的非空音频。")
+            duration_seconds(audio)
+            event["status"] = "downloaded"
+            return
+        except (subprocess.SubprocessError, RuntimeError, ValueError) as error:
+            event["status"] = "failed"
+            event["error"] = str(error)
+            if attempt == 2:
+                raise RuntimeError(f"{package} 升级后重试仍失败：{error}") from error
+            update = update_downloader(package)
+            event["update_check"] = update
+            if update["status"] != "updated":
+                raise RuntimeError(f"{package} 下载失败；更新检查状态 {update['status']}。原始错误：{error}") from error
+            if audio.exists():
+                # This file was created by the failed attempt; preserve it before retrying.
+                saved = audio.with_name(f"{audio.stem}-failed-{uuid.uuid4().hex[:8]}{audio.suffix}")
+                audio.rename(saved)
+                log(f"保留本轮无效音频：{saved}")
+
+
 def duration_seconds(audio):
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(audio)],
@@ -61,26 +156,45 @@ def duration_seconds(audio):
     return duration
 
 
-def download_audio(url, stem, directory, auth_file=None):
+def download_audio(url, stem, directory, auth_file=None, cookies_file=None, events=None):
+    platform, _, _ = source_identity(url)
+    package = "yt-dlp" if platform == "youtube" else "yutto"
+    events = events if events is not None else []
     directory.mkdir(parents=True, exist_ok=True)
     audio = directory / f"{stem}.m4a"
-    if audio.is_file() and audio.stat().st_size:
+    if audio.exists():
         duration_seconds(audio)
         log(f"复用音频：{audio}")
+        events.append({"downloader": package, "version": package_version(package), "status": "reused"})
         return audio
-    command = [
-        sys.executable, "-m", "yutto", url, "--audio-only", "--no-danmaku",
-        "--no-subtitle", "--no-cover", "--no-chapter-info",
-        "--output-format-audio-only", "m4a", "-aq", "30280",
-        "-d", str(directory), "-tp", stem, "--no-color", "--no-progress",
-    ]
-    if auth_file:
-        command.extend(["--auth-file", str(auth_file)])
+    if platform == "youtube":
+        command = [
+            sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
+            "--no-progress", "--no-overwrites", "--no-write-subs", "--no-write-auto-subs",
+            "--no-write-thumbnail", "--no-write-info-json", "--no-write-playlist-metafiles",
+            "--no-keep-video", "-f", "bestaudio", "-x", "--audio-format", "m4a",
+            "--audio-quality", "0", "--socket-timeout", "20", "--retries", "1",
+            "--extractor-retries", "1", "--fragment-retries", "1",
+            "-o", str(directory / f"{stem}.%(ext)s"),
+        ]
+        runtime = next((name for name in ("deno", "node", "bun", "qjs") if shutil.which(name)), None)
+        if runtime:
+            runtime_name = "quickjs" if runtime == "qjs" else runtime
+            command.extend(["--js-runtimes", f"{runtime_name}:{shutil.which(runtime)}"])
+        if cookies_file:
+            command.extend(["--cookies", str(cookies_file)])
+        command.append(url)
+    else:
+        command = [
+            sys.executable, "-m", "yutto", url, "--audio-only", "--no-danmaku",
+            "--no-subtitle", "--no-cover", "--no-chapter-info",
+            "--output-format-audio-only", "m4a", "-aq", "30280",
+            "-d", str(directory), "-tp", stem, "--no-color", "--no-progress",
+        ]
+        if auth_file:
+            command.extend(["--auth-file", str(auth_file)])
     log(f"下载音频到：{audio}")
-    subprocess.run(command, check=True, timeout=600)
-    if not audio.is_file() or not audio.stat().st_size:
-        raise RuntimeError("yutto 没有生成预期音频；检查下载日志、登录要求或网络状态。")
-    duration_seconds(audio)
+    run_download(command, package, audio, events)
     return audio
 
 
@@ -308,7 +422,7 @@ def positive_float(value):
 def main(argv=None):
     started = time.perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("url", nargs="?", help="标准 Bilibili 视频链接或 BV/av 号")
+    parser.add_argument("url", nargs="?", help="Bilibili/YouTube 视频链接或 BV/av 号")
     parser.add_argument("--audio", type=Path, help="继续转写本地音频，不传 URL")
     parser.add_argument("--project-dir", type=Path, default=Path.cwd())
     parser.add_argument("--download-dir", type=Path, default=Path.home() / "Downloads")
@@ -323,6 +437,7 @@ def main(argv=None):
     parser.add_argument("--limit-seconds", type=positive_float, help="仅转写开头片段，输出标记 sample")
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--auth-file", type=Path)
+    parser.add_argument("--cookies-file", type=Path, help="用户提供的 YouTube Netscape Cookie 文件")
     args = parser.parse_args(argv)
     if bool(args.url) == bool(args.audio):
         parser.error("必须提供 URL 或 --audio，二选一。")
@@ -335,7 +450,13 @@ def main(argv=None):
             raise RuntimeError(f"PATH 中缺少 {tool}。")
     if args.auth_file:
         args.auth_file = args.auth_file.expanduser().resolve(strict=True)
-    url, download_stem = video_identity(args.url) if args.url else (None, args.audio.stem)
+    if args.cookies_file:
+        args.cookies_file = args.cookies_file.expanduser().resolve(strict=True)
+    platform, url, download_stem = source_identity(args.url) if args.url else ("local", None, args.audio.stem)
+    if platform == "youtube" and args.auth_file:
+        parser.error("YouTube 请使用 --cookies-file；--auth-file 仅用于 yutto。")
+    if platform == "bilibili" and args.cookies_file:
+        parser.error("Bilibili 请使用 --auth-file；--cookies-file 仅用于 yt-dlp。")
     stem = args.output_name or download_stem
     if stem in {".", ".."} or not stem.strip() or "/" in stem or "\\" in stem:
         raise ValueError("--output-name 必须是非空文件名，不能含路径。")
@@ -346,9 +467,19 @@ def main(argv=None):
     mode = "chunked" if args.chunk_length_seconds is not None else "native"
     srt_path = choose_output(project, stem, mode, run_id)
     diagnostics_path = args.diagnostics_dir.expanduser().resolve() / f"{stem}-{run_id}.json"
-    audio = args.audio.expanduser().resolve(strict=True) if args.audio else download_audio(
-        url, download_stem, args.download_dir.expanduser().resolve(), args.auth_file,
-    )
+    download_events = []
+    try:
+        audio = args.audio.expanduser().resolve(strict=True) if args.audio else download_audio(
+            url, download_stem, args.download_dir.expanduser().resolve(), args.auth_file,
+            args.cookies_file, download_events,
+        )
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
+        write_diagnostics(diagnostics_path, {
+            "script_version": SCRIPT_VERSION, "run_id": run_id, "source_platform": platform,
+            "source_url": url, "stage": "download", "error": str(error), "download_events": download_events,
+        })
+        log(f"下载失败诊断：{diagnostics_path}")
+        raise
     duration = duration_seconds(audio)
     log(f"音频：{audio}；完整时长 {duration:.2f} 秒。")
     if args.download_only:
@@ -362,6 +493,7 @@ def main(argv=None):
     payload = save_subtitles(srt_path, diagnostics_path, result, {
         **configuration, "run_id": run_id, "elapsed_seconds": time.perf_counter() - started,
         "model": MODEL_ID, "return_timestamps": True, "task": "transcribe",
+        "source_platform": platform, "download_events": download_events,
         "source_url": url, "audio_path": str(audio), "language": args.language or "auto",
         "audio_duration_seconds": duration,
         "transcribed_duration_seconds": transcribed_duration,

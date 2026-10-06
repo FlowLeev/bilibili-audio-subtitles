@@ -1,4 +1,4 @@
 interface:
-  display_name: "Bilibili 音频转字幕"
-  short_description: "用 yutto 下载 B 站音频，用 Whisper 生成一份 SRT 并检查分段与重复异常"
-  default_prompt: "使用 $bilibili-audio-subtitles 下载这个 Bilibili 视频的音频，生成一份 SRT 到当前项目，并报告质量告警。"
+  display_name: "Bilibili / YouTube 音频转字幕"
+  short_description: "用 yutto 或 yt-dlp 下载音频并生成一份 SRT，下载失败优先检查对应包更新"
+  default_prompt: "使用 $bilibili-audio-subtitles 下载这个 Bilibili 或 YouTube 视频的音频，生成一份 SRT 到当前项目，并报告质量告警。"
